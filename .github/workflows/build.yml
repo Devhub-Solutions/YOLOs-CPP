@@ -1,16 +1,16 @@
-name: Multi-OS Binary Build
+name: Multi-OS Binary Release
 
 on:
-  workflow_dispatch:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build ${{ matrix.artifact_name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -34,11 +34,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ─── Dependencies ────────────────────────────────────────────────────────
+
       - name: Install Dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopencv-dev build-essential cmake curl
+          sudo apt-get install -y libopencv-dev build-essential cmake curl zip
 
       - name: Install Dependencies (Windows)
         if: matrix.os == 'windows-latest'
@@ -46,7 +48,6 @@ jobs:
         run: |
           choco install opencv -y --no-progress
 
-          # Chocolatey extracts OpenCV to C:\tools\opencv
           $candidates = @(
             "C:\tools\opencv\build",
             "C:\opencv\build"
@@ -74,6 +75,8 @@ jobs:
         run: |
           brew install opencv cmake
 
+      # ─── ONNX Runtime ────────────────────────────────────────────────────────
+
       - name: Download ONNX Runtime
         shell: bash
         run: |
@@ -83,7 +86,6 @@ jobs:
 
           if [[ "${{ matrix.ort_asset }}" == *.zip ]]; then
             unzip ort_archive -d ort_extracted
-            # The zip creates a subdirectory, find it
             ORT_SUBDIR=$(ls -d ort_extracted/onnxruntime-win-x64-* 2>/dev/null | head -1)
             if [[ -n "$ORT_SUBDIR" ]]; then
               echo "ONNXRUNTIME_DIR=$GITHUB_WORKSPACE/$ORT_SUBDIR" >> $GITHUB_ENV
@@ -96,21 +98,23 @@ jobs:
             echo "ONNXRUNTIME_DIR=$GITHUB_WORKSPACE/ort_extracted" >> $GITHUB_ENV
           fi
 
+      # ─── Build ───────────────────────────────────────────────────────────────
+
       - name: Configure and Build
         shell: bash
         run: |
           mkdir build && cd build
 
-          # Build cmake args
           CMAKE_ARGS="-DONNXRUNTIME_DIR=${ONNXRUNTIME_DIR} -DCMAKE_BUILD_TYPE=Release"
 
-          # Pass OpenCV_DIR explicitly on Windows
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             CMAKE_ARGS="$CMAKE_ARGS -DOpenCV_DIR=${OpenCV_DIR}"
           fi
 
           cmake .. $CMAKE_ARGS
           cmake --build . --config Release --parallel
+
+      # ─── Prepare Binaries ────────────────────────────────────────────────────
 
       - name: Prepare Binaries
         shell: bash
@@ -140,49 +144,86 @@ jobs:
             cp "${ONNXRUNTIME_DIR}/lib/libonnxruntime."*.dylib "release_binaries/${{ matrix.artifact_name }}/"
           fi
 
+      # ─── Package ─────────────────────────────────────────────────────────────
+
+      - name: Package Binaries
+        shell: bash
+        run: |
+          cd release_binaries/${{ matrix.artifact_name }}
+
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            zip -r ../../sdk-${{ matrix.artifact_name }}.zip .
+          else
+            tar -czf ../../sdk-${{ matrix.artifact_name }}.tar.gz .
+          fi
+
+      # ─── Checksum ────────────────────────────────────────────────────────────
+
+      - name: Generate Checksum
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            sha256sum sdk-${{ matrix.artifact_name }}.zip > sdk-${{ matrix.artifact_name }}.sha256
+          else
+            sha256sum sdk-${{ matrix.artifact_name }}.tar.gz > sdk-${{ matrix.artifact_name }}.sha256
+          fi
+
+      # ─── Upload Artifact ─────────────────────────────────────────────────────
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ matrix.artifact_name }}
-          path: release_binaries/
+          name: sdk-${{ matrix.artifact_name }}
+          path: |
+            sdk-${{ matrix.artifact_name }}.*
 
-  commit-binaries:
-    name: Commit Binaries to Branch
+  # ─── Release ─────────────────────────────────────────────────────────────────
+
+  release:
+    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
+    steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: all_binaries
+          path: artifacts
 
-      - name: Prepare release branch
+      - name: Generate version tag
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          VERSION=v$(date +'%Y.%m.%d.%H%M')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
 
-          # Create or switch to 'binaries' branch
-          if git rev-parse --verify origin/binaries >/dev/null 2>&1; then
-            git checkout binaries
-          else
-            git checkout --orphan binaries
-            git rm -rf .
-          fi
+      - name: Merge checksums
+        run: |
+          find artifacts -name "*.sha256" -exec cat {} \; > checksums.txt
+          echo "=== checksums.txt ==="
+          cat checksums.txt
 
-          # Copy binaries to organized folders
-          mkdir -p bin
-          cp -r all_binaries/binaries-*/* bin/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: "Release ${{ env.VERSION }}"
+          body: |
+            ## 🚀 Release ${{ env.VERSION }}
 
-          # Add a README for the branch
-          echo "# Project Binaries" > README.md
-          echo "This branch contains pre-built binaries for multiple operating systems." >> README.md
-          echo "Generated by GitHub Actions at $(date)" >> README.md
+            Automatically built from `main` branch.
 
-          git add .
-          git commit -m "chore: update binaries for all platforms [skip ci]" || echo "No changes to commit"
-          git push origin binaries --force
+            ### Assets
+            | File | Platform |
+            |------|----------|
+            | `sdk-linux-x64.tar.gz` | Linux x64 |
+            | `sdk-win-x64.zip` | Windows x64 |
+            | `sdk-macos-arm64.tar.gz` | macOS ARM64 |
+
+            ### SDK Auto-Update
+            Fetch latest release via API:
+            ```
+            GET https://api.github.com/repos/${{ github.repository }}/releases/latest
+            ```
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            checksums.txt

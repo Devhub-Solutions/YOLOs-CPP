@@ -3,6 +3,8 @@ name: Multi-OS Binary Release
 on:
   push:
     branches: [ "main" ]
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -47,33 +49,21 @@ jobs:
         shell: pwsh
         run: |
           choco install opencv -y --no-progress
-
-          $candidates = @(
-            "C:\tools\opencv\build",
-            "C:\opencv\build"
-          )
-
+          $candidates = @("C:\tools\opencv\build", "C:\opencv\build")
           $found = $candidates | Where-Object { Test-Path "$_\OpenCVConfig.cmake" } | Select-Object -First 1
-
           if (-not $found) {
-            Write-Host "Falling back to recursive search for OpenCVConfig.cmake..."
-            $found = Get-ChildItem -Path "C:\" -Recurse -Filter "OpenCVConfig.cmake" -ErrorAction SilentlyContinue |
-                     Select-Object -First 1 |
-                     ForEach-Object { $_.DirectoryName }
+            $found = Get-ChildItem -Path "C:\" -Recurse -Filter "OpenCVConfig.cmake" -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { $_.DirectoryName }
           }
-
           if ($found) {
             echo "OpenCV_DIR=$found" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            Write-Host "OpenCV_DIR set to: $found"
           } else {
-            Write-Error "Could not find OpenCVConfig.cmake. OpenCV may not have installed correctly."
+            Write-Error "Could not find OpenCVConfig.cmake."
             exit 1
           }
 
       - name: Install Dependencies (macOS)
         if: matrix.os == 'macos-latest'
-        run: |
-          brew install opencv cmake
+        run: brew install opencv cmake
 
       # ─── ONNX Runtime ────────────────────────────────────────────────────────
 
@@ -83,15 +73,10 @@ jobs:
           ORT_VERSION="1.20.1"
           URL="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${{ matrix.ort_asset }}"
           curl -L -o ort_archive "${URL}"
-
           if [[ "${{ matrix.ort_asset }}" == *.zip ]]; then
             unzip ort_archive -d ort_extracted
             ORT_SUBDIR=$(ls -d ort_extracted/onnxruntime-win-x64-* 2>/dev/null | head -1)
-            if [[ -n "$ORT_SUBDIR" ]]; then
-              echo "ONNXRUNTIME_DIR=$GITHUB_WORKSPACE/$ORT_SUBDIR" >> $GITHUB_ENV
-            else
-              echo "ONNXRUNTIME_DIR=$GITHUB_WORKSPACE/ort_extracted" >> $GITHUB_ENV
-            fi
+            echo "ONNXRUNTIME_DIR=$GITHUB_WORKSPACE/${ORT_SUBDIR:-ort_extracted}" >> $GITHUB_ENV
           else
             mkdir -p ort_extracted
             tar -xzf ort_archive -C ort_extracted --strip-components=1
@@ -104,13 +89,8 @@ jobs:
         shell: bash
         run: |
           mkdir build && cd build
-
           CMAKE_ARGS="-DONNXRUNTIME_DIR=${ONNXRUNTIME_DIR} -DCMAKE_BUILD_TYPE=Release"
-
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            CMAKE_ARGS="$CMAKE_ARGS -DOpenCV_DIR=${OpenCV_DIR}"
-          fi
-
+          [[ "${{ matrix.os }}" == "windows-latest" ]] && CMAKE_ARGS="$CMAKE_ARGS -DOpenCV_DIR=${OpenCV_DIR}"
           cmake .. $CMAKE_ARGS
           cmake --build . --config Release --parallel
 
@@ -120,22 +100,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p release_binaries/${{ matrix.artifact_name }}
-
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            BUILD_OUT="build/Release"
-          else
-            BUILD_OUT="build"
-          fi
-
+          BUILD_OUT=$([[ "${{ matrix.os }}" == "windows-latest" ]] && echo "build/Release" || echo "build")
           EXES=("image_inference" "video_inference" "camera_inference" "class_image_inference" "batch_image_inference")
-
           for exe in "${EXES[@]}"; do
-            if [ -f "${BUILD_OUT}/${exe}${{ matrix.extension }}" ]; then
-              cp "${BUILD_OUT}/${exe}${{ matrix.extension }}" "release_binaries/${{ matrix.artifact_name }}/"
-            fi
+            [ -f "${BUILD_OUT}/${exe}${{ matrix.extension }}" ] && cp "${BUILD_OUT}/${exe}${{ matrix.extension }}" "release_binaries/${{ matrix.artifact_name }}/"
           done
-
-          # Copy ONNX Runtime shared libraries
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             cp "${ONNXRUNTIME_DIR}/lib/onnxruntime.dll" "release_binaries/${{ matrix.artifact_name }}/"
           elif [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
@@ -149,12 +118,12 @@ jobs:
       - name: Package Binaries
         shell: bash
         run: |
+          VERSION=$([[ "${{ github.ref_type }}" == "tag" ]] && echo "${{ github.ref_name }}" || echo "latest")
           cd release_binaries/${{ matrix.artifact_name }}
-
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            zip -r ../../sdk-${{ matrix.artifact_name }}.zip .
+            zip -r ../../yolos-cpp-${VERSION}-${{ matrix.artifact_name }}.zip .
           else
-            tar -czf ../../sdk-${{ matrix.artifact_name }}.tar.gz .
+            tar -czf ../../yolos-cpp-${VERSION}-${{ matrix.artifact_name }}.tar.gz .
           fi
 
       # ─── Checksum ────────────────────────────────────────────────────────────
@@ -162,10 +131,11 @@ jobs:
       - name: Generate Checksum
         shell: bash
         run: |
+          VERSION=$([[ "${{ github.ref_type }}" == "tag" ]] && echo "${{ github.ref_name }}" || echo "latest")
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            sha256sum sdk-${{ matrix.artifact_name }}.zip > sdk-${{ matrix.artifact_name }}.sha256
+            sha256sum yolos-cpp-${VERSION}-${{ matrix.artifact_name }}.zip > yolos-cpp-${VERSION}-${{ matrix.artifact_name }}.sha256
           else
-            sha256sum sdk-${{ matrix.artifact_name }}.tar.gz > sdk-${{ matrix.artifact_name }}.sha256
+            sha256sum yolos-cpp-${VERSION}-${{ matrix.artifact_name }}.tar.gz > yolos-cpp-${VERSION}-${{ matrix.artifact_name }}.sha256
           fi
 
       # ─── Upload Artifact ─────────────────────────────────────────────────────
@@ -174,55 +144,71 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sdk-${{ matrix.artifact_name }}
-          path: |
-            sdk-${{ matrix.artifact_name }}.*
+          path: yolos-cpp-*.*
 
-  # ─── Release ─────────────────────────────────────────────────────────────────
+  publish_binaries:
+    name: Update Binaries Branch
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout binaries branch
+        uses: actions/checkout@v4
+        with:
+          ref: binaries
+          path: binaries_repo
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Organize and Commit Binaries
+        run: |
+          VERSION=${{ github.ref_name }}
+          mkdir -p binaries_repo/versions/${VERSION}
+          
+          # Copy artifacts to versioned folders
+          cp artifacts/sdk-linux-x64/yolos-cpp-${VERSION}-linux-x64.tar.gz binaries_repo/versions/${VERSION}/
+          cp artifacts/sdk-win-x64/yolos-cpp-${VERSION}-win-x64.zip binaries_repo/versions/${VERSION}/
+          cp artifacts/sdk-macos-arm64/yolos-cpp-${VERSION}-macos-arm64.tar.gz binaries_repo/versions/${VERSION}/
+          
+          # Update 'latest' symlinks or copies
+          mkdir -p binaries_repo/latest
+          cp binaries_repo/versions/${VERSION}/* binaries_repo/latest/
+          
+          cd binaries_repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Publish binaries for ${VERSION}"
+          git push origin binaries
 
   release:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
-
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Generate version tag
-        run: |
-          VERSION=v$(date +'%Y.%m.%d.%H%M')
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-
       - name: Merge checksums
-        run: |
-          find artifacts -name "*.sha256" -exec cat {} \; > checksums.txt
-          echo "=== checksums.txt ==="
-          cat checksums.txt
+        run: find artifacts -name "*.sha256" -exec cat {} \; > checksums.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.VERSION }}
-          name: "Release ${{ env.VERSION }}"
+          tag_name: ${{ github.ref_name }}
+          name: "Release ${{ github.ref_name }}"
           body: |
-            ## 🚀 Release ${{ env.VERSION }}
-
-            Automatically built from `main` branch.
-
+            ## 🚀 Release ${{ github.ref_name }}
+            Automatically built from tag `${{ github.ref_name }}`.
+            
             ### Assets
-            | File | Platform |
-            |------|----------|
-            | `sdk-linux-x64.tar.gz` | Linux x64 |
-            | `sdk-win-x64.zip` | Windows x64 |
-            | `sdk-macos-arm64.tar.gz` | macOS ARM64 |
-
-            ### SDK Auto-Update
-            Fetch latest release via API:
-            ```
-            GET https://api.github.com/repos/${{ github.repository }}/releases/latest
-            ```
+            Check the attached files for binaries for Linux, Windows, and macOS.
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip
